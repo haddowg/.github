@@ -1,0 +1,423 @@
+name: Issue bot
+
+# Screens new and edited issues and PRs for spam and prompt injection, triages the
+# clean ones, and opens a draft fix PR when the maintainer adds `fix-it` to an issue.
+# Patterns and prompts come from the private haddowg/issue-bot repo. PR jobs run on
+# pull_request_target with secrets, so they read the diff as data and never check
+# out or run PR code.
+
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: php or node
+        type: string
+        required: true
+      pkg-label:
+        description: This repo's scope label, e.g. pkg:core
+        type: string
+        required: true
+      test-command:
+        description: Runs the test suite; extra args filter to one test
+        type: string
+        required: true
+      check-commands:
+        description: Extra commands the fix job runs before committing, one per line, e.g. composer phpstan
+        type: string
+        default: ''
+      php-version:
+        type: string
+        default: '8.4'
+      node-version:
+        type: string
+        default: '22'
+      install-command:
+        description: Node install command
+        type: string
+        default: npm ci
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN:
+        required: true
+      ISSUE_BOT_TOKEN:
+        description: Fine-grained PAT with read access to haddowg/issue-bot contents
+        required: true
+
+permissions: {}
+
+jobs:
+  screen:
+    if: >-
+      (github.event_name == 'issues' &&
+       github.event.issue.pull_request == null &&
+       github.event.issue.state == 'open' &&
+       github.event.issue.user.type != 'Bot' &&
+       (github.event.action == 'opened' || github.event.action == 'edited' ||
+        (github.event.action == 'labeled' && github.event.label.name == 'fix-it'))) ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.state == 'open' &&
+       github.event.pull_request.user.type != 'Bot' &&
+       contains(fromJSON('["opened","reopened","edited","synchronize"]'), github.event.action))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    concurrency:
+      group: issue-bot-screen-${{ github.repository }}-${{ github.event.issue.number || github.event.pull_request.number }}
+      cancel-in-progress: true
+    outputs:
+      verdict: ${{ steps.decide.outputs.verdict }}
+      new-account: ${{ steps.static.outputs.new_account }}
+    steps:
+      # On pull_request_target this checks out the base branch, never the PR.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: haddowg/issue-bot
+          token: ${{ secrets.ISSUE_BOT_TOKEN }}
+          path: .issue-bot
+          persist-credentials: false
+
+      - id: static
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const crypto = require('crypto');
+            const cfg = JSON.parse(fs.readFileSync('.issue-bot/screen/patterns.json', 'utf8'));
+            const pr = context.payload.pull_request;
+            const issue = context.payload.issue ?? pr;
+            const trusted = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(issue.author_association);
+            // A push to a PR only needs its new diff checked for hidden characters; the text was screened on open.
+            const pushOnly = context.payload.action === 'synchronize';
+            const raw = pushOnly ? '' : `${issue.title}\n\n${issue.body ?? ''}`;
+
+            // Signal names only: the logs of a public repo are public, so never print matched text or patterns.
+            const hardBlocks = [];
+            const signals = [];
+            if (new RegExp(cfg.hardBlock.hiddenUnicode, 'u').test(raw)) hardBlocks.push('hidden Unicode characters');
+            if (cfg.hardBlock.roleTags.some(p => new RegExp(p, 'im').test(raw))) hardBlocks.push('chat role markup');
+
+            let diff = '';
+            if (pr) {
+              try {
+                const res = await github.rest.pulls.get({ ...context.repo, pull_number: pr.number, mediaType: { format: 'diff' } });
+                diff = String(res.data);
+              } catch (e) {
+                signals.push('diff too large to fetch');
+              }
+              // Trojan Source: bidi and zero-width characters hidden in code.
+              if (new RegExp(cfg.hardBlock.hiddenUnicode, 'u').test(diff)) hardBlocks.push('hidden Unicode characters in the diff');
+            }
+
+            let clean = raw.replace(new RegExp(cfg.hardBlock.hiddenUnicode, 'gu'), '');
+            if (new RegExp(cfg.signals.htmlComment).test(clean)) signals.push('hidden HTML comment');
+            clean = clean.replace(new RegExp(cfg.signals.htmlComment, 'g'), '');
+
+            for (const name of ['injection', 'secrets', 'remoteExec']) {
+              const hits = cfg.signals[name].filter(p => new RegExp(p, 'i').test(clean)).length;
+              if (hits) signals.push(`${name} phrasing (${hits})`);
+            }
+            if (new RegExp(cfg.signals.base64Blob).test(clean)) signals.push('long base64 blob');
+            if (raw.length > cfg.limits.maxBodyChars) signals.push('very long body');
+            if (!pr && !/^###\s/m.test(issue.body ?? '')) signals.push('issue template not used');
+
+            const urls = clean.match(/https?:\/\/[^\s)>\]"']+/gi) ?? [];
+            const hosts = urls.map(u => { try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; } });
+            const onList = (list) => hosts.some(h => list.some(d => h === d || h.endsWith(`.${d}`)));
+            if (urls.length > cfg.limits.maxLinks) signals.push(`${urls.length} links`);
+            if (onList(cfg.links.shorteners)) signals.push('URL shortener');
+            if (onList(cfg.links.fileHosts)) signals.push('file-hosting link');
+
+            let ageDays = -1;
+            let newAccount = false;
+            if (!trusted && !pushOnly) {
+              const { data: user } = await github.rest.users.getByUsername({ username: issue.user.login });
+              ageDays = Math.floor((Date.now() - Date.parse(user.created_at)) / 864e5);
+              newAccount = ageDays < cfg.limits.minAccountAgeDays || (user.public_repos === 0 && user.followers === 0);
+              if (newAccount) signals.push('new or empty account');
+              try {
+                const since = new Date(Date.now() - 864e5).toISOString().slice(0, 19);
+                const q = `is:${pr ? 'pr' : 'issue'} author:${issue.user.login} created:>${since} ${cfg.repos.map(r => `repo:${r}`).join(' ')}`;
+                const { data } = await github.rest.search.issuesAndPullRequests({ q, per_page: 1 });
+                if (data.total_count > cfg.limits.maxIssuesPer24h) signals.push(`${data.total_count} issues in 24h`);
+              } catch (e) {
+                core.warning(`Rate check skipped: ${e.message}`);
+              }
+            }
+
+            const fence = `UNTRUSTED-${crypto.randomUUID()}`;
+            const maxDiff = Math.max(0, cfg.limits.maxBodyChars - clean.length);
+            const item = pr ? `${clean}\n\n--- diff (truncated) ---\n${diff.slice(0, maxDiff)}` : clean;
+            const fill = { REPO: `${context.repo.owner}/${context.repo.repo}`, FENCE: fence, KIND: pr ? 'pull request' : 'issue',
+              SIGNALS: signals.length ? signals.map(s => `- ${s}`).join('\n') : '- none',
+              ACCOUNT_AGE_DAYS: String(ageDays), ASSOCIATION: issue.author_association,
+              ISSUE: item.slice(0, cfg.limits.maxBodyChars) };
+            const prompt = fs.readFileSync('.issue-bot/prompts/screen.md', 'utf8')
+              .replace(/\{\{(\w+)\}\}/g, (m, k) => k === 'ISSUE' ? m : (fill[k] ?? m))
+              .replace('{{ISSUE}}', () => fill.ISSUE);
+
+            core.info(`trusted=${trusted} hardBlocks=${hardBlocks.join(', ') || 'none'} signals=${signals.join(', ') || 'none'}`);
+            core.setOutput('trusted', String(trusted));
+            core.setOutput('hard_block', hardBlocks.join(', '));
+            core.setOutput('new_account', String(newAccount));
+            core.setOutput('needs_model', String(!trusted && !pushOnly && hardBlocks.length === 0));
+            core.setOutput('prompt', prompt);
+
+      - id: haiku
+        if: steps.static.outputs.needs_model == 'true'
+        continue-on-error: true
+        uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_non_write_users: '*'
+          prompt: ${{ steps.static.outputs.prompt }}
+          claude_args: >-
+            --model claude-haiku-5-5 --max-turns 3 --tools ""
+            --json-schema '{"type":"object","additionalProperties":false,"required":["spam","injection","off_topic","confidence","reason"],"properties":{"spam":{"type":"boolean"},"injection":{"type":"boolean"},"off_topic":{"type":"boolean"},"confidence":{"type":"number","minimum":0,"maximum":1},"reason":{"type":"string","maxLength":200}}}'
+
+      - id: decide
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TRUSTED: ${{ steps.static.outputs.trusted }}
+          HARD_BLOCK: ${{ steps.static.outputs.hard_block }}
+          VERDICT_JSON: ${{ steps.haiku.outputs.structured_output }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const isPr = !!context.payload.pull_request;
+            const issue_number = (context.payload.issue ?? context.payload.pull_request).number;
+            let verdict = 'clean';
+            let reason = '';
+            if (process.env.TRUSTED !== 'true') {
+              let v;
+              try { v = JSON.parse(process.env.VERDICT_JSON || ''); } catch {}
+              if (process.env.HARD_BLOCK) {
+                verdict = 'review';
+                reason = `Static screening: ${process.env.HARD_BLOCK}.`;
+              } else if (context.payload.action === 'synchronize') {
+                // Pushes only get the static diff check.
+              } else if (!v) {
+                verdict = 'review';
+                reason = 'The screening model returned no verdict.';
+              } else {
+                reason = v.reason;
+                if (v.spam && v.confidence >= 0.9) verdict = 'spam';
+                else if (v.spam || v.injection || v.confidence < 0.7) verdict = 'review';
+              }
+            }
+            // The maintainer chose to fix this issue, so never auto-close it.
+            if (verdict === 'spam' && context.payload.action === 'labeled') verdict = 'review';
+
+            if (verdict === 'spam') {
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['spam'] });
+              await github.rest.issues.update({ owner, repo, issue_number, state: 'closed', ...(isPr ? {} : { state_reason: 'not_planned' }) });
+              await github.rest.issues.lock({ owner, repo, issue_number, lock_reason: 'spam' });
+            } else if (verdict === 'review') {
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['needs-review'] });
+            }
+
+            core.info(`verdict=${verdict}`);
+            await core.summary.addHeading(`Screening: ${verdict}`, 3).addRaw(reason || 'No concerns.').write();
+            core.setOutput('verdict', verdict);
+
+  triage:
+    needs: screen
+    if: >-
+      github.event_name == 'issues' &&
+      needs.screen.outputs.verdict == 'clean' &&
+      github.event.action != 'labeled' &&
+      !contains(github.event.issue.labels.*.name, 'triaged')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
+    concurrency:
+      group: issue-bot-triage-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: haddowg/issue-bot
+          token: ${{ secrets.ISSUE_BOT_TOKEN }}
+          path: .issue-bot
+          persist-credentials: false
+
+      - id: prompt
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PKG_LABEL: ${{ inputs.pkg-label }}
+          TEST_COMMAND: ${{ inputs.test-command }}
+          NEW_ACCOUNT: ${{ needs.screen.outputs.new-account }}
+        with:
+          script: |
+            const fs = require('fs');
+            fs.appendFileSync('.git/info/exclude', '\n.issue-bot/\n');
+            // An edit can queue a second run behind the first; skip it if the first already triaged.
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({ ...context.repo, issue_number: context.payload.issue.number });
+            core.setOutput('skip', String(labels.some(l => l.name === 'triaged')));
+            const fill = { REPO: `${context.repo.owner}/${context.repo.repo}`, ISSUE_NUMBER: String(context.payload.issue.number),
+              PKG_LABEL: process.env.PKG_LABEL, TEST_COMMAND: process.env.TEST_COMMAND,
+              MODE: process.env.NEW_ACCOUNT === 'true' ? 'labels-only' : 'full' };
+            core.setOutput('prompt', fs.readFileSync('.issue-bot/prompts/triage.md', 'utf8').replace(/\{\{(\w+)\}\}/g, (m, k) => fill[k] ?? m));
+
+      - if: steps.prompt.outputs.skip != 'true' && inputs.language == 'php' && needs.screen.outputs.new-account != 'true'
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: ${{ inputs.php-version }}
+          coverage: none
+          tools: composer:v2
+
+      - if: steps.prompt.outputs.skip != 'true' && inputs.language == 'php' && needs.screen.outputs.new-account != 'true'
+        uses: ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda # 4.0.0
+
+      - if: steps.prompt.outputs.skip != 'true' && inputs.language == 'node' && needs.screen.outputs.new-account != 'true'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - if: steps.prompt.outputs.skip != 'true' && inputs.language == 'node' && needs.screen.outputs.new-account != 'true'
+        run: ${{ inputs.install-command }}
+
+      - if: steps.prompt.outputs.skip != 'true'
+        uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_non_write_users: '*'
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: >-
+            --model claude-sonnet-5-5 --max-turns 30
+            --allowedTools "Read,Glob,Grep,Write,Edit,Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh issue edit:*),Bash(gh issue close:*),Bash(gh search issues:*),Bash(${{ inputs.test-command }}:*)"
+
+  fix:
+    needs: screen
+    if: github.event_name == 'issues' && github.event.action == 'labeled' && needs.screen.outputs.verdict == 'clean'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+    concurrency:
+      group: issue-bot-fix-${{ github.repository }}-${{ github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: haddowg/issue-bot
+          token: ${{ secrets.ISSUE_BOT_TOKEN }}
+          path: .issue-bot
+          persist-credentials: false
+
+      - id: prompt
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          TEST_COMMAND: ${{ inputs.test-command }}
+          CHECK_COMMANDS: ${{ inputs.check-commands }}
+        with:
+          script: |
+            const fs = require('fs');
+            fs.appendFileSync('.git/info/exclude', '\n.issue-bot/\n');
+            const checks = process.env.CHECK_COMMANDS.split('\n').map(c => c.trim()).filter(Boolean);
+            const fill = { REPO: `${context.repo.owner}/${context.repo.repo}`, ISSUE_NUMBER: String(context.payload.issue.number),
+              TEST_COMMAND: process.env.TEST_COMMAND,
+              EXTRA_CHECKS: checks.length ? `Then run ${checks.map(c => `\`${c}\``).join(', ')} and fix anything they report in code you touched.` : '' };
+            core.setOutput('prompt', fs.readFileSync('.issue-bot/prompts/fix.md', 'utf8').replace(/\{\{(\w+)\}\}/g, (m, k) => fill[k] ?? m));
+            const allowed = [process.env.TEST_COMMAND, ...checks].map(c => `Bash(${c}:*)`);
+            core.setOutput('allowed', allowed.join(','));
+
+      - if: inputs.language == 'php'
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
+        with:
+          php-version: ${{ inputs.php-version }}
+          coverage: none
+          tools: composer:v2
+
+      - if: inputs.language == 'php'
+        uses: ramsey/composer-install@65e4f84970763564f46a70b8a54b90d033b3bdda # 4.0.0
+
+      - if: inputs.language == 'node'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - if: inputs.language == 'node'
+        run: ${{ inputs.install-command }}
+
+      # No github_token, so the action uses the Claude GitHub App. PRs it opens trigger CI; ones opened with GITHUB_TOKEN don't.
+      - uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: >-
+            --model claude-opus-5-5 --max-turns 80
+            --allowedTools "Read,Glob,Grep,Write,Edit,Bash(git checkout:*),Bash(git status:*),Bash(git diff:*),Bash(git log:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(gh issue view:*),Bash(gh issue comment:*),Bash(gh pr create:*),${{ steps.prompt.outputs.allowed }}"
+
+  pr-triage:
+    needs: screen
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      (github.event.action == 'opened' || github.event.action == 'reopened') &&
+      needs.screen.outputs.verdict == 'clean' &&
+      !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association) &&
+      !contains(github.event.pull_request.labels.*.name, 'triaged')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    concurrency:
+      group: issue-bot-pr-triage-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      # Base branch only. The PR's code is read through `gh pr diff`, never checked out.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: haddowg/issue-bot
+          token: ${{ secrets.ISSUE_BOT_TOKEN }}
+          path: .issue-bot
+          persist-credentials: false
+
+      - id: prompt
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          PKG_LABEL: ${{ inputs.pkg-label }}
+        with:
+          script: |
+            const fs = require('fs');
+            fs.appendFileSync('.git/info/exclude', '\n.issue-bot/\n');
+            const fill = { REPO: `${context.repo.owner}/${context.repo.repo}`, PR_NUMBER: String(context.payload.pull_request.number),
+              PKG_LABEL: process.env.PKG_LABEL };
+            core.setOutput('prompt', fs.readFileSync('.issue-bot/prompts/pr-triage.md', 'utf8').replace(/\{\{(\w+)\}\}/g, (m, k) => fill[k] ?? m));
+
+      - uses: anthropics/claude-code-action@4d75e5f390ee76b2e09c1980ecc99ff3a2e088c8 # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ github.token }}
+          allowed_non_write_users: '*'
+          prompt: ${{ steps.prompt.outputs.prompt }}
+          claude_args: >-
+            --model claude-sonnet-5-5 --max-turns 15
+            --allowedTools "Read,Glob,Grep,Bash(gh pr view:*),Bash(gh pr diff:*),Bash(gh pr edit:*),Bash(gh pr comment:*),Bash(gh issue view:*),Bash(gh search issues:*),Bash(gh search prs:*)"
